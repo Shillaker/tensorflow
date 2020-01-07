@@ -20,6 +20,7 @@ from __future__ import print_function
 import json
 
 from tensorflow.python.eager import function as defun
+from tensorflow.python.framework import ops
 from tensorflow.python.framework import tensor_spec
 from tensorflow.python.keras import regularizers
 from tensorflow.python.keras.engine import input_spec
@@ -55,6 +56,9 @@ network_lib = LazyLoader(
 training_lib = LazyLoader(
     "training_lib", globals(),
     "tensorflow.python.keras.engine.training")
+training_lib_v1 = LazyLoader(
+    "training_lib_v1", globals(),
+    "tensorflow.python.keras.engine.training_v1")
 # pylint:enable=g-inconsistent-quotes
 
 
@@ -102,6 +106,15 @@ def load(path, compile=True):  # pylint: disable=redefined-builtin
   return model
 
 
+def _is_graph_network(node):
+  # pylint: disable=protected-access
+  return (
+      isinstance(node, RevivedNetwork) and
+      node._serialized_attributes['metadata'].get('is_graph_network', False) and
+      hasattr(node, '_config'))
+  # pylint: enable=protected-access
+
+
 class KerasObjectLoader(tf_load.Loader):
   """Loader that recreates Keras objects."""
 
@@ -117,8 +130,7 @@ class KerasObjectLoader(tf_load.Loader):
     for node in self._nodes:
       if isinstance(node, RevivedLayer):
         node.built = True
-        is_graph_network = node._serialized_attributes['metadata'].get(
-            'is_graph_network', False)
+        is_graph_network = _is_graph_network(node)
         if not (isinstance(node, models_lib.Sequential) or is_graph_network):
           if hasattr(node.keras_api, 'call_and_return_conditional_losses'):
             node.call = utils.use_wrapped_call(
@@ -135,8 +147,7 @@ class KerasObjectLoader(tf_load.Loader):
           inputs = call_fn.input_signature[0]
 
         # Set model inputs and outputs.
-        is_graph_network = node._serialized_attributes['metadata'].get(
-            'is_graph_network', False)
+        is_graph_network = _is_graph_network(node)
         if isinstance(node, models_lib.Sequential):
           with trackable.no_automatic_dependency_tracking_scope(node):
             node._layers = []
@@ -189,11 +200,16 @@ class KerasObjectLoader(tf_load.Loader):
     # pylint: enable=protected-access
 
   def _recreate_base_user_object(self, proto):
+    if ops.executing_eagerly_outside_functions():
+      model_class = training_lib.Model
+    else:
+      model_class = training_lib_v1.Model
+
     revived_classes = {
         '_tf_keras_layer': (RevivedLayer, base_layer.Layer),
         '_tf_keras_input_layer': (RevivedInputLayer, input_layer.InputLayer),
         '_tf_keras_network': (RevivedNetwork, network_lib.Network),
-        '_tf_keras_model': (RevivedNetwork, training_lib.Model),
+        '_tf_keras_model': (RevivedNetwork, model_class),
         '_tf_keras_sequential': (RevivedNetwork, models_lib.Sequential)
     }
 
@@ -203,9 +219,7 @@ class KerasObjectLoader(tf_load.Loader):
       parent_classes = revived_classes[proto.identifier]
       metadata = json.loads(proto.metadata)
       revived_cls = type(
-          compat.as_str(metadata['class_name']),
-          parent_classes,
-          {'__setattr__': parent_classes[1].__setattr__})
+          compat.as_str(metadata['class_name']), parent_classes, {})
       return revived_cls._init_from_metadata(metadata)  # pylint: disable=protected-access
 
     return super(KerasObjectLoader, self)._recreate_base_user_object(proto)
@@ -359,7 +373,7 @@ def _set_network_attributes_from_metadata(revived_obj):
     # pylint:disable=protected-access
     metadata = revived_obj._serialized_attributes['metadata']
     if metadata.get('dtype') is not None:
-      revived_obj._dtype = metadata['dtype']
+      revived_obj._set_dtype_policy(metadata['dtype'])
     revived_obj.trainable = metadata['trainable']
 
     revived_obj._expects_training_arg = metadata['expects_training_arg']
@@ -370,4 +384,3 @@ def _set_network_attributes_from_metadata(revived_obj):
       revived_obj.activity_regularizer = regularizers.deserialize(
           metadata['activity_regularizer'])
     # pylint:enable=protected-access
-

@@ -37,7 +37,7 @@ namespace gpu {
 // Currently, there are two main use cases for a tiling scheme. First, we
 // implement kernels with 0-2-1 memory transpose using shared memory to improve
 // memory access pattern. Second, we implement reduction to contiguous
-// dimensions in layout, with or without memory tranpsose, to achieve better
+// dimensions in layout, with or without memory transpose, to achieve better
 // memory access pattern as well as to reduce the need numbers of executed
 // expensive instructions, such as thread synchronization related instructions
 // and atomic operations. For both use cases, we can apply a normalization to
@@ -85,15 +85,14 @@ class KernelMappingScheme {
         dims_in_tiles_{dims_in_elems[0],
                        CeilOfRatio<int64>(dims_in_elems[1], tile_size_y),
                        CeilOfRatio<int64>(dims_in_elems[2], tile_size_x)},
-        dims_in_blocks_{dims_in_elems[0] / block_size_z, dims_in_tiles_[1],
-                        dims_in_tiles_[2]},
+        dims_in_blocks_{CeilOfRatio<int64>(dims_in_tiles_[0], block_size_z),
+                        dims_in_tiles_[1], dims_in_tiles_[2]},
         block_size_z_{block_size_z},
         num_threads_x_(num_threads_x),
         num_threads_y_(num_threads_y),
         dilated_x_(is_dilated_x) {
     CHECK_EQ(tile_size_y % num_threads_y_, 0);
     CHECK_EQ(tile_size_x % num_threads_x_, 0);
-    CHECK_EQ((dims_in_elems[0] % block_size_z), 0);
     VLOG(10) << "dims_in_elems_ = " << absl::StrJoin(dims_in_elems_, ",");
     VLOG(10) << "dims_in_tiles_ = " << absl::StrJoin(dims_in_tiles_, ",");
     VLOG(10) << "dims_in_blocks_ = " << absl::StrJoin(dims_in_blocks_, ",");
@@ -109,8 +108,8 @@ class KernelMappingScheme {
     return dims_in_elems_;
   }
 
-  // Ratio of elements in each dimension over tile sizes for Z/Y/X
-  // respectively.
+  // Number of tiles required to cover the input tensor in each dimension (Z/Y/X
+  // respectively).
   absl::Span<const int64> GetDimensionsInTiles() const {
     return dims_in_tiles_;
   }
@@ -120,24 +119,16 @@ class KernelMappingScheme {
     return dims_in_blocks_;
   }
 
-  int64 GetNumberOfTilesInTotal() const {
-    return absl::c_accumulate(dims_in_tiles_, 1LL, std::multiplies<int64>());
-  }
-
   int64 GetNumberOfTilesInOneBlock() const { return block_size_z_; }
 
-  int64 BlockSize(int d) const {
-    DCHECK(d >= DimZ && d <= DimX);
-    if (d == DimZ) {
-      return block_size_z_;
-    }
-    return 1;
-  }
+  int64 BlockSizeZ() const { return block_size_z_; }
 
   int64 GetNumberOfBlocks() const {
     return absl::c_accumulate(dims_in_blocks_, 1, std::multiplies<int64>());
   }
 
+  // Tile size for a given dimensions. Tiles are assigned per thread block,
+  // and are processed by all threads in the block.
   int64 GetTileSizeForDimension(int d) const { return tile_sizes_.at(d); }
   int64 GetTileSizeForDimensionX() const {
     return GetTileSizeForDimension(DimX);
@@ -170,8 +161,8 @@ class KernelMappingScheme {
   // and tile_sizes_.
   const std::array<int64, 3> dims_in_tiles_;
 
-  // The number of blocks in each dimension of a tile block. It is computed from
-  // dims_in_tile_ and block_sizes_.
+  // The number of blocks in each dimension. It is computed from dims_in_tile_
+  // and block_size_z_.
   const std::array<int64, 3> dims_in_blocks_;
 
   const int64 block_size_z_;

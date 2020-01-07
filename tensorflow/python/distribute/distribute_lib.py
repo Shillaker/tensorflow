@@ -15,8 +15,8 @@
 """Library for running a computation across multiple devices.
 
 See the guide for overview and examples:
-[TensorFlow v1.x](https://www.tensorflow.org/guide/distribute_strategy),
-[TensorFlow v2.x](https://www.tensorflow.org/alpha/guide/distribute_strategy).
+[TensorFlow v2.x](https://www.tensorflow.org/guide/distributed_training),
+[TensorFlow v1.x](https://github.com/tensorflow/docs/blob/master/site/en/r1/guide/distribute_strategy.ipynb).  # pylint: disable=line-too-long
 
 The intent of this library is that you can write an algorithm in a stylized way
 and it will be usable with a variety of different `tf.distribute.Strategy`
@@ -102,7 +102,7 @@ import weakref
 
 import six
 
-from tensorflow.python.autograph.core import ag_ctx
+from tensorflow.python.autograph.core import ag_ctx as autograph_ctx
 from tensorflow.python.autograph.impl import api as autograph
 from tensorflow.python.data.ops import dataset_ops
 from tensorflow.python.distribute import device_util
@@ -110,7 +110,7 @@ from tensorflow.python.distribute import distribution_strategy_context
 from tensorflow.python.distribute import numpy_dataset
 from tensorflow.python.distribute import reduce_util
 from tensorflow.python.eager import context as eager_context
-from tensorflow.python.eager import tape
+from tensorflow.python.eager import monitoring
 from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import ops
@@ -120,6 +120,7 @@ from tensorflow.python.ops import control_flow_ops
 from tensorflow.python.ops import custom_gradient
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import resource_variable_ops
+from tensorflow.python.ops import summary_ops_v2
 from tensorflow.python.ops import variable_scope
 from tensorflow.python.ops.losses import loss_reduction
 from tensorflow.python.ops.losses import losses_impl
@@ -135,13 +136,13 @@ from tensorflow.tools.docs import doc_controls
 # Context tracking whether in a strategy.update() or .update_non_slot() call.
 
 
-_update_device = threading.local()
+_update_replica_id = threading.local()
 
 
-def get_update_device():
+def get_update_replica_id():
   """Get the current device if in a `tf.distribute.Strategy.update()` call."""
   try:
-    return _update_device.current
+    return _update_replica_id.current
   except AttributeError:
     return None
 
@@ -149,17 +150,17 @@ def get_update_device():
 class UpdateContext(object):
   """Context manager when you are in `update()` or `update_non_slot()`."""
 
-  def __init__(self, device):
-    self._device = device
-    self._old_device = None
+  def __init__(self, replica_id):
+    self._replica_id = replica_id
+    self._old_replica_id = None
 
   def __enter__(self):
-    self._old_device = get_update_device()
-    _update_device.current = self._device
+    self._old_replica_id = get_update_replica_id()
+    _update_replica_id.current = self._replica_id
 
   def __exit__(self, exception_type, exception_value, traceback):
     del exception_type, exception_value, traceback
-    _update_device.current = self._old_device
+    _update_replica_id.current = self._old_replica_id
 
 
 # ------------------------------------------------------------------------------
@@ -414,18 +415,18 @@ class InputContext(object):
 class Strategy(object):
   """A state & compute distribution policy on a list of devices.
 
-  See [the guide](https://www.tensorflow.org/alpha/guide/distribute_strategy)
+  See [the guide](https://www.tensorflow.org/guide/distributed_training)
   for overview and examples.
 
   In short:
 
   * To use it with Keras `compile`/`fit`,
     [please
-    read](https://www.tensorflow.org/alpha/guide/distribute_strategy#using_tfdistributestrategy_with_keras).
+    read](https://www.tensorflow.org/guide/distributed_training#using_tfdistributestrategy_with_keras).
   * You may pass descendant of `tf.distribute.Strategy` to
     `tf.estimator.RunConfig` to specify how a `tf.estimator.Estimator`
     should distribute its computation. See
-    [guide](https://www.tensorflow.org/alpha/guide/distribute_strategy#using_tfdistributestrategy_with_estimator).
+    [guide](https://www.tensorflow.org/guide/distributed_training#using_tfdistributestrategy_with_estimator_limited_support).
   * Otherwise, use `tf.distribute.Strategy.scope` to specify that a
     strategy should be used when building an executing your model.
     (This puts you in the "cross-replica context" for this strategy, which
@@ -433,7 +434,7 @@ class Strategy(object):
   * If you are writing a custom training loop, you will need to call a few more
     methods,
     [see the
-    guide](https://www.tensorflow.org/alpha/guide/distribute_strategy#using_tfdistributestrategy_with_custom_training_loops):
+    guide](https://www.tensorflow.org/guide/distributed_training#using_tfdistributestrategy_with_custom_training_loops):
 
       * Start by either creating a `tf.data.Dataset` normally or using
         `tf.distribute.experimental_make_numpy_dataset` to make a dataset out of
@@ -489,7 +490,7 @@ class Strategy(object):
 
   See the
   [custom training loop
-  tutorial](https://www.tensorflow.org/alpha/tutorials/distribute/training_loops)
+  tutorial](https://www.tensorflow.org/tutorials/distribute/custom_training)
   for a more detailed example.
 
   Note: `tf.distribute.Strategy` currently does not support TensorFlow's
@@ -514,11 +515,12 @@ class Strategy(object):
       try:
         extended._retrace_functions_for_each_device = (
             len(extended.worker_devices) > 1)
+        distribution_strategy_replica_gauge.get_cell("num_replicas").set(
+            self.num_replicas_in_sync)
       except:  # pylint: disable=bare-except
         # Default for the case where extended.worker_devices can't return
         # a sensible value.
         extended._retrace_functions_for_each_device = True
-      # pylint: enable=protected-access
 
   @property
   def extended(self):
@@ -627,6 +629,7 @@ class Strategy(object):
 
     # Distribute that dataset
     dist_dataset = strategy.experimental_distribute_dataset(dataset)
+
     # Iterate over the distributed dataset
     for x in dist_dataset:
       # process dataset elements
@@ -650,8 +653,7 @@ class Strategy(object):
     `.shard` operation to the end of the processing pipeline. This will cause
     the entire preprocessing pipeline for all the data to be run on every
     worker, and each worker will do redundant work. We will print a warning
-    if this method of sharding is selected. In this case, consider using
-    `experimental_distribute_datasets_from_function` instead.
+    if this method of sharding is selected.
 
     You can disable dataset sharding across workers using the `auto_shard`
     option in `tf.data.experimental.DistributeOptions`.
@@ -663,6 +665,32 @@ class Strategy(object):
     If the above batch splitting and dataset sharding logic is undesirable,
     please use `experimental_distribute_datasets_from_function` instead, which
     does not do any automatic splitting or sharding.
+
+    You can also use the `element_spec` property of the distributed dataset
+    returned by this API to query the `tf.TypeSpec` of the elements returned
+    by the iterator. This can be used to set the `input_signature` property
+    of a `tf.function`.
+
+     ```python
+    strategy = tf.distribute.MirroredStrategy()
+
+    # Create a dataset
+    dataset = dataset_ops.Dataset.TFRecordDataset([
+      "/a/1.tfr", "/a/2.tfr", "/a/3.tfr", "/a/4.tfr"])
+
+    # Distribute that dataset
+    dist_dataset = strategy.experimental_distribute_dataset(dataset)
+
+    @tf.function(input_signature=[dist_dataset.element_spec])
+    def train_step(inputs):
+      # train model with inputs
+      return
+
+    # Iterate over the distributed dataset
+    for x in dist_dataset:
+      # process dataset elements
+      strategy.experimental_run_v2(train_step, args=(x,))
+    ```
 
     Args:
       dataset: `tf.data.Dataset` that will be sharded across all replicas using
@@ -713,6 +741,26 @@ class Strategy(object):
     the global batch size.  This may be computed using
     `input_context.get_per_replica_batch_size`.
 
+    To query the `tf.TypeSpec` of the elements in the distributed dataset
+    returned by this API, you need to use the `element_spec` property of the
+    distributed iterator. This `tf.TypeSpec` can be used to set the
+    `input_signature` property of a `tf.function`.
+
+    ```python
+    # If you want to specify `input_signature` for a `tf.function` you must
+    # first create the iterator.
+    iterator = iter(inputs)
+
+    @tf.function(input_signature=[iterator.element_spec])
+    def replica_fn_with_signature(inputs):
+      # train the model with inputs
+      return
+
+    for _ in range(steps):
+      strategy.experimental_run_v2(replica_fn_with_signature,
+          args=(next(iterator),))
+    ```
+
     Args:
       dataset_fn: A function taking a `tf.distribute.InputContext` instance and
         returning a `tf.data.Dataset`.
@@ -753,11 +801,15 @@ class Strategy(object):
       structure can either be "per-replica" `Tensor` objects or `Tensor`s
       (for example, if running on a single replica).
     """
+    if not isinstance(args, (list, tuple)):
+      raise ValueError(
+          "positional args must be a list or tuple, got {}".format(type(args)))
+
     with self.scope():
       # tf.distribute supports Eager functions, so AutoGraph should not be
       # applied when when the caller is also in Eager mode.
-      fn = autograph.tf_convert(fn, ag_ctx.control_status_ctx(),
-                                convert_by_default=False)
+      fn = autograph.tf_convert(
+          fn, autograph_ctx.control_status_ctx(), convert_by_default=False)
       return self._extended.call_for_each_replica(fn, args=args, kwargs=kwargs)
 
   def reduce(self, reduce_op, value, axis):
@@ -839,7 +891,7 @@ class Strategy(object):
         if dim is not None:
           # By returning a python value in the static shape case, we can
           # maybe get a fast path for reducing the denominator.
-          return numer, dim
+          return numer, array_ops.constant(dim, dtype=dtypes.int64)
       elif axis < 0:
         axis = axis + array_ops.rank(v)
       if v.shape.rank == 1:
@@ -1162,8 +1214,8 @@ class StrategyExtendedV2(object):
 
   *Replica context vs. Cross-replica context*
 
-  _replica context_ is when we are in some function that is being called once
-  for each replica.  Otherwise we are in cross-replica context, which is
+  A _replica context_ applies when we are in some function that is being called
+  once for each replica.  Otherwise we are in cross-replica context, which is
   useful for calling `tf.distribute.Strategy` methods which operate across the
   replicas (like `reduce_to()`). By default you start in a replica context
   (the "default single replica context") and then some methods can switch you
@@ -1537,6 +1589,8 @@ class StrategyExtendedV2(object):
     _require_cross_replica_or_default_context_extended(self)
     if kwargs is None:
       kwargs = {}
+    fn = autograph.tf_convert(
+        fn, autograph_ctx.control_status_ctx(), convert_by_default=False)
     with self._container_strategy().scope():
       return self._update(var, fn, args, kwargs, group)
 
@@ -1561,6 +1615,8 @@ class StrategyExtendedV2(object):
     _require_cross_replica_or_default_context_extended(self)
     if kwargs is None:
       kwargs = {}
+    fn = autograph.tf_convert(
+        fn, autograph_ctx.control_status_ctx(), convert_by_default=False)
     with self._container_strategy().scope():
       return self._update_non_slot(colocate_with, fn, args, kwargs, group)
 
@@ -1661,6 +1717,8 @@ class StrategyExtendedV2(object):
 
     Subclasses should override this to provide whether the strategy is
     currently in multi-worker setup.
+
+    Experimental. Signature and implementation are subject to change.
     """
     raise NotImplementedError("must be implemented in descendants")
 
@@ -1894,19 +1952,19 @@ class ReplicaContext(object):
 
   def __enter__(self):
     _push_per_thread_mode(self._thread_context)
-    ctx = eager_context.context()
 
     def replica_id_is_zero():
       return math_ops.equal(self._replica_id_in_sync_group,
                             constant_op.constant(0))
 
+    summary_state = summary_ops_v2._summary_state  # pylint: disable=protected-access
     self._summary_recording_distribution_strategy = (
-        ctx.summary_recording_distribution_strategy)
-    ctx.summary_recording_distribution_strategy = replica_id_is_zero
+        summary_state.is_recording_distribution_strategy)
+    summary_state.is_recording_distribution_strategy = replica_id_is_zero
 
   def __exit__(self, exception_type, exception_value, traceback):
-    ctx = eager_context.context()
-    ctx.summary_recording_distribution_strategy = (
+    summary_state = summary_ops_v2._summary_state  # pylint: disable=protected-access
+    summary_state.is_recording_distribution_strategy = (
         self._summary_recording_distribution_strategy)
     _pop_per_thread_mode()
 
@@ -1942,6 +2000,8 @@ class ReplicaContext(object):
     require_replica_context(self)
     if kwargs is None:
       kwargs = {}
+    merge_fn = autograph.tf_convert(
+        merge_fn, autograph_ctx.control_status_ctx(), convert_by_default=False)
     return self._merge_call(merge_fn, args, kwargs)
 
   def _merge_call(self, merge_fn, args, kwargs):
@@ -2268,85 +2328,12 @@ _get_default_replica_mode = (
     distribution_strategy_context._get_default_replica_mode)  # pylint: disable=protected-access
 
 
-def create_mirrored_variable(  # pylint: disable=missing-docstring
-    strategy, device_map, logical_device, real_mirrored_creator, mirrored_cls,
-    sync_on_read_cls, *args, **kwargs):
-  # Figure out what collections this variable should be added to.
-  # We'll add the MirroredVariable to those collections instead.
-  collections = kwargs.pop("collections", None)
-  if collections is None:
-    collections = [ops.GraphKeys.GLOBAL_VARIABLES]
-  kwargs["collections"] = []
-
-  synchronization = kwargs.get(
-      "synchronization", variable_scope.VariableSynchronization.ON_WRITE)
-
-  if synchronization == variable_scope.VariableSynchronization.NONE:
-    raise ValueError(
-        "`NONE` variable synchronization mode is not supported with `Mirrored` "
-        "distribution strategy. Please change the `synchronization` for "
-        "variable: " + kwargs["name"])
-  elif synchronization == variable_scope.VariableSynchronization.ON_READ:
-    is_sync_on_read = True
-  elif synchronization in (
-      variable_scope.VariableSynchronization.ON_WRITE,
-      variable_scope.VariableSynchronization.AUTO):
-    # `AUTO` synchronization defaults to `ON_WRITE`.
-    is_sync_on_read = False
-  else:
-    raise ValueError(
-        "Invalid variable synchronization mode: %s for variable: %s" %
-        (synchronization, kwargs["name"]))
-
-  aggregation = kwargs.pop(
-      "aggregation", variable_scope.VariableAggregation.NONE)
-
-  if aggregation not in (
-      variable_scope.VariableAggregation.NONE,
-      variable_scope.VariableAggregation.SUM,
-      variable_scope.VariableAggregation.MEAN,
-      variable_scope.VariableAggregation.ONLY_FIRST_REPLICA):
-    raise ValueError(
-        "Invalid variable aggregation mode: %s for variable: %s" %
-        (aggregation, kwargs["name"]))
-
-  # Ignore user-specified caching device, not needed for mirrored variables.
-  kwargs.pop("caching_device", None)
-
-  # TODO(josh11b,apassos): It would be better if variable initialization
-  # was never recorded on the tape instead of having to do this manually
-  # here.
-  with tape.stop_recording():
-    devices = device_map.logical_to_actual_devices(logical_device)
-    value_list = real_mirrored_creator(devices, *args, **kwargs)
-
-    var_cls = sync_on_read_cls if is_sync_on_read else mirrored_cls
-
-    result = var_cls(
-        strategy, device_map, value_list, aggregation,
-        logical_device=logical_device)
-
-  # Add the wrapped variable to the requested collections.
-  # The handling of eager mode and the global step matches
-  # ResourceVariable._init_from_args().
-  if not eager_context.executing_eagerly():
-    g = ops.get_default_graph()
-    # If "trainable" is True, next_creator() will add the member variables
-    # to the TRAINABLE_VARIABLES collection, so we manually remove
-    # them and replace with the MirroredVariable. We can't set
-    # "trainable" to False for next_creator() since that causes functions
-    # like implicit_gradients to skip those variables.
-    if kwargs.get("trainable", True):
-      collections.append(ops.GraphKeys.TRAINABLE_VARIABLES)
-      l = g.get_collection_ref(ops.GraphKeys.TRAINABLE_VARIABLES)
-      for value in value_list:
-        for i, trainable_variable in enumerate(l):
-          if value is trainable_variable:
-            del l[i]
-            break
-
-    g.add_to_collections(collections, result)
-  elif ops.GraphKeys.GLOBAL_STEP in collections:
-    ops.add_to_collections(ops.GraphKeys.GLOBAL_STEP, result)
-
-  return result
+# ------------------------------------------------------------------------------
+# Metrics to track which distribution strategy is being called
+distribution_strategy_gauge = monitoring.StringGauge(
+    "/tensorflow/api/distribution_strategy",
+    "Gauge to track the type of distribution strategy used.", "TFVersion")
+distribution_strategy_replica_gauge = monitoring.IntGauge(
+    "/tensorflow/api/distribution_strategy/replica",
+    "Gauge to track the number of replica each distribution strategy used.",
+    "CountType")
